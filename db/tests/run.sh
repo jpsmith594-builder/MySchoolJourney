@@ -9,11 +9,12 @@ P="psql -v ON_ERROR_STOP=1 -q"
 
 $P -d postgres -c "drop database if exists $DB" -c "create database $DB" 2>&1 | grep -v NOTICE || true
 $P -d "$DB" -f "$here/00_supabase_stubs.sql"
-$P -d "$DB" -f "$here/../schema.sql"
-$P -d "$DB" -f "$here/../seed.sql"
+for f in "$here"/../../supabase/migrations/*.sql; do
+  $P -d "$DB" -f "$f"
+done
 $P -d "$DB" \
   -c "grant select, insert, update, delete on all tables in schema public to authenticated" \
   -c "grant select, insert, update, delete on storage.objects to authenticated" \
   -c "grant execute on all functions in schema public to authenticated"
-$P -d "$DB" -f "$here/10_rls_and_scan_flow.sql" 2>&1 | grep -E 'NOTICE|ERROR|CONTEXT' | sed 's/^psql:[^ ]* //'
+$P -d "$DB" -f "$here/10_rls_and_marks.sql" 2>&1 | grep -E 'NOTICE|ERROR|CONTEXT' | sed 's/^psql:[^ ]* //'
 echo "All tests passed (any ERROR line above means a failure)."

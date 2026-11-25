@@ -1,7 +1,12 @@
 -- =====================================================================
--- My High School Journal: data model v0.1 (draft)
+-- My School Journey: data model v0.2 (draft)
 -- Target: Postgres 15+ on Supabase (uses auth.users, auth.uid(), storage.*)
 -- Run order: schema.sql, then seed.sql
+--
+-- v0.2 changes: marks can never be hidden from guardians (and every change is logged),
+-- two averages (with and without Life Orientation), learner-specific extra subjects,
+-- the full CAPS subject list (see seed.sql), and report cards are stored as attachments
+-- for record keeping instead of being read by a scanner.
 -- =====================================================================
 
 -- ---------------------------------------------------------------------
@@ -53,7 +58,7 @@ create table consents (
   id             uuid primary key default gen_random_uuid(),
   learner_id     uuid not null references learners(id) on delete cascade,
   guardian_id    uuid not null references profiles(id),
-  purpose        text not null check (purpose in ('store_results', 'scan_reports', 'career_insights', 'learner_account')),
+  purpose        text not null check (purpose in ('store_results', 'store_report_copies', 'career_insights', 'learner_account')),
   policy_version text not null,
   granted_at     timestamptz not null default now(),
   withdrawn_at   timestamptz
@@ -100,23 +105,42 @@ create trigger learners_creator_guardian
   for each row execute function learners_add_creator_as_guardian();
 
 -- ---------------------------------------------------------------------
--- Reference data (maintained by us, read-only for users)
+-- Subjects
 -- ---------------------------------------------------------------------
 
+-- The CAPS subjects (seed.sql) plus any extra subjects a family adds for one learner.
+--   created_for_learner is null     -> a standard subject, maintained by us
+--   created_for_learner is not null -> an extra subject, visible only to that learner's people
+-- min_grade and max_grade are the typical range, used to suggest subjects. They are NOT enforced,
+-- because schools differ; any subject can be recorded against any grade.
+-- parent_subject_id links a component to its umbrella (History and Geography sit under Social Sciences,
+-- the four art forms under Creative Arts, and so on). If a term has a mark for the umbrella, its
+-- components are left out of the averages so nothing is counted twice.
 create table subjects (
   id                    smallint generated always as identity primary key,
-  key                   text not null unique,
+  key                   text unique,
   name                  text not null,
   short_name            text not null,
   category              text not null check (category in
-                          ('language', 'mathematics', 'science', 'humanities', 'commerce', 'technology', 'arts', 'life_skills')),
-  min_grade             smallint not null default 1  check (min_grade between 0 and 12),
+                          ('language', 'mathematics', 'science', 'humanities', 'commerce', 'technology',
+                           'agriculture', 'services', 'arts', 'life_skills', 'other')),
+  min_grade             smallint not null default 0  check (min_grade between 0 and 12),
   max_grade             smallint not null default 12 check (max_grade between 0 and 12),
-  counts_toward_average boolean  not null default true,  -- flip off for subjects a school or university excludes
-  check (min_grade <= max_grade)
+  parent_subject_id     smallint references subjects(id),
+  is_life_orientation   boolean  not null default false,  -- drives the "average excluding Life Orientation"
+  counts_toward_average boolean  not null default true,   -- every standard subject counts; extra subjects can opt out
+  created_for_learner   uuid references learners(id) on delete cascade,
+  created_at            timestamptz not null default now(),
+  check (min_grade <= max_grade),
+  check ((created_for_learner is null and key is not null)
+      or (created_for_learner is not null and key is null)),
+  check (created_for_learner is null or (parent_subject_id is null and not is_life_orientation))
 );
 
--- Names seen on real reports ("Maths", "Wiskunde") mapped to one subject. Stored lower case.
+create unique index subjects_extra_name on subjects (created_for_learner, lower(name))
+  where created_for_learner is not null;
+
+-- Names seen on reports or typed by people ("Maths", "Wiskunde", "LO"), mapped to one subject. Lower case.
 create table subject_aliases (
   alias      text primary key check (alias = lower(btrim(alias))),
   subject_id smallint not null references subjects(id) on delete cascade
@@ -147,7 +171,13 @@ create table enrolments (
   learner_id    uuid not null references learners(id) on delete cascade,
   calendar_year smallint not null check (calendar_year between 2000 and 2100),
   grade         smallint not null check (grade between 0 and 12),
-  phase         text generated always as (case when grade <= 7 then 'primary' else 'high' end) stored,
+  -- CAPS phase: Foundation R-3, Intermediate 4-6, Senior 7-9, FET 10-12
+  phase         text generated always as (
+                  case when grade <= 3 then 'foundation'
+                       when grade <= 6 then 'intermediate'
+                       when grade <= 9 then 'senior'
+                       else 'fet' end) stored,
+  school_level  text generated always as (case when grade <= 7 then 'primary' else 'high' end) stored,
   school_name   text,
   created_at    timestamptz not null default now(),
   unique (learner_id, calendar_year),
@@ -156,73 +186,32 @@ create table enrolments (
 
 -- One row per enrolment per term.
 create table term_results (
-  id              uuid primary key default gen_random_uuid(),
-  learner_id      uuid not null,
-  enrolment_id    uuid not null,
-  term            smallint not null check (term between 1 and 4),
+  id               uuid primary key default gen_random_uuid(),
+  learner_id       uuid not null,
+  enrolment_id     uuid not null,
+  term             smallint not null check (term between 1 and 4),
   reported_average numeric(5,2) check (reported_average between 0 and 100),  -- average printed on the report, to cross-check ours
-  report_date     date,
-  created_at      timestamptz not null default now(),
-  updated_at      timestamptz not null default now(),
+  report_date      date,
+  created_at       timestamptz not null default now(),
+  updated_at       timestamptz not null default now(),
   foreign key (enrolment_id, learner_id) references enrolments(id, learner_id) on delete cascade,
   unique (enrolment_id, term),
   unique (id, learner_id)
 );
 
--- ---------------------------------------------------------------------
--- Scanning: upload, extract, learner confirms, then marks are saved
--- ---------------------------------------------------------------------
-
-create table report_uploads (
-  id             uuid primary key default gen_random_uuid(),
-  learner_id     uuid not null references learners(id) on delete cascade,
-  enrolment_id   uuid,
-  term           smallint check (term between 1 and 4),
-  storage_path   text not null,   -- object in the private 'report-scans' bucket: <learner_id>/<upload_id>.<ext>
-  mime_type      text not null,
-  status         text not null default 'uploaded' check (status in
-                   ('uploaded', 'processing', 'needs_review', 'confirmed', 'failed', 'discarded')),
-  extractor      text,            -- which pipeline and version read it
-  raw_extraction jsonb,           -- untouched extractor output, for debugging and re-runs
-  error_message  text,
-  uploaded_by    uuid not null references profiles(id),
-  uploaded_at    timestamptz not null default now(),
-  processed_at   timestamptz,
-  confirmed_at   timestamptz,
-  delete_after   timestamptz,     -- retention: remove the original image after confirmation
-  foreign key (enrolment_id, learner_id) references enrolments(id, learner_id) on delete cascade,
-  unique (id, learner_id)
-);
-
--- What the extractor read, held here until the learner confirms. Not used in any chart.
-create table upload_rows (
-  id            uuid primary key default gen_random_uuid(),
-  learner_id    uuid not null,
-  upload_id     uuid not null,
-  row_index     smallint not null,
-  reported_name text not null,
-  subject_id    smallint references subjects(id),   -- suggested by alias match, editable
-  mark_percent  numeric(5,2) check (mark_percent between 0 and 100),
-  achievement_level smallint check (achievement_level between 1 and 7),
-  confidence    numeric(3,2) check (confidence between 0 and 1),
-  needs_check   boolean not null default false,     -- shown in coral on the confirm screen
-  foreign key (upload_id, learner_id) references report_uploads(id, learner_id) on delete cascade,
-  unique (upload_id, row_index)
-);
-
--- Confirmed marks. Everything the charts show comes from here.
+-- Marks are typed in by the learner or a guardian. This is the source of every chart.
+-- A learner can add and correct marks but cannot delete them, and every change is logged (mark_audit).
 create table subject_marks (
   id                uuid primary key default gen_random_uuid(),
   learner_id        uuid not null,
   term_result_id    uuid not null,
-  subject_id        smallint not null references subjects(id),
-  reported_name     text,                      -- what the report called it
+  -- Deferred so erasing a learner can remove their extra subjects and marks in one go. It also means
+  -- an extra subject that still has marks cannot be deleted (the commit fails), so that cannot hide marks.
+  subject_id        smallint not null references subjects(id) deferrable initially deferred,
+  reported_name     text,                      -- what the report called it, if different
   mark_percent      numeric(5,2) check (mark_percent between 0 and 100),
-  achievement_level smallint check (achievement_level between 1 and 7),  -- primary school reports often show levels
-  source            text not null default 'manual' check (source in ('manual', 'scan')),
-  upload_id         uuid references report_uploads(id) on delete set null,
-  confirmed_by      uuid references profiles(id),
-  confirmed_at      timestamptz,
+  achievement_level smallint check (achievement_level between 1 and 7),  -- primary reports often show levels
+  entered_by        uuid default auth.uid() references profiles(id) on delete set null,
   created_at        timestamptz not null default now(),
   updated_at        timestamptz not null default now(),
   foreign key (term_result_id, learner_id) references term_results(id, learner_id) on delete cascade,
@@ -230,54 +219,96 @@ create table subject_marks (
   check (mark_percent is not null or achievement_level is not null)
 );
 
--- Turn a reviewed upload into term results and marks, in one transaction.
-create or replace function confirm_upload(p_upload_id uuid) returns void
-language plpgsql security invoker as $$
-declare
-  u  report_uploads;
-  tr uuid;
+-- Who changed which mark, when, from what to what. Guardians and the learner can read it; nobody can edit it.
+create table mark_audit (
+  id                    bigint generated always as identity primary key,
+  learner_id            uuid not null references learners(id) on delete cascade,
+  term_result_id        uuid,       -- no foreign key on purpose: history outlives the mark
+  subject_id            smallint,
+  action                text not null check (action in ('insert', 'update', 'delete')),
+  old_mark_percent      numeric(5,2),
+  new_mark_percent      numeric(5,2),
+  old_achievement_level smallint,
+  new_achievement_level smallint,
+  changed_by            uuid,
+  changed_at            timestamptz not null default now()
+);
+
+create or replace function log_mark_change() returns trigger
+language plpgsql security definer set search_path = public as $$
 begin
-  select * into u from report_uploads where id = p_upload_id for update;
-  if not found then
-    raise exception 'upload not found';
+  if tg_op = 'INSERT' then
+    insert into mark_audit (learner_id, term_result_id, subject_id, action,
+                            new_mark_percent, new_achievement_level, changed_by)
+    values (new.learner_id, new.term_result_id, new.subject_id, 'insert',
+            new.mark_percent, new.achievement_level, auth.uid());
+    return new;
+  elsif tg_op = 'UPDATE' then
+    if (old.mark_percent, old.achievement_level, old.subject_id)
+       is distinct from (new.mark_percent, new.achievement_level, new.subject_id) then
+      insert into mark_audit (learner_id, term_result_id, subject_id, action,
+                              old_mark_percent, new_mark_percent,
+                              old_achievement_level, new_achievement_level, changed_by)
+      values (new.learner_id, new.term_result_id, new.subject_id, 'update',
+              old.mark_percent, new.mark_percent,
+              old.achievement_level, new.achievement_level, auth.uid());
+    end if;
+    return new;
+  else
+    -- When a whole learner is erased the learner row is already gone: log nothing, the data is being removed.
+    if exists (select 1 from learners where id = old.learner_id) then
+      insert into mark_audit (learner_id, term_result_id, subject_id, action,
+                              old_mark_percent, old_achievement_level, changed_by)
+      values (old.learner_id, old.term_result_id, old.subject_id, 'delete',
+              old.mark_percent, old.achievement_level, auth.uid());
+    end if;
+    return old;
   end if;
-  if u.enrolment_id is null or u.term is null then
-    raise exception 'choose the grade and term first';
-  end if;
-  if exists (select 1 from upload_rows where upload_id = p_upload_id and (subject_id is null or needs_check)) then
-    raise exception 'every row needs a subject and a confirmed mark';
-  end if;
-
-  if exists (select 1 from upload_rows where upload_id = p_upload_id
-             group by subject_id having count(*) > 1) then
-    raise exception 'two rows are assigned to the same subject';
-  end if;
-
-  insert into term_results (learner_id, enrolment_id, term)
-  values (u.learner_id, u.enrolment_id, u.term)
-  on conflict (enrolment_id, term) do update set updated_at = now()
-  returning id into tr;
-
-  insert into subject_marks (learner_id, term_result_id, subject_id, reported_name,
-                             mark_percent, achievement_level, source, upload_id, confirmed_by, confirmed_at)
-  select r.learner_id, tr, r.subject_id, r.reported_name,
-         r.mark_percent, r.achievement_level, 'scan', u.id, auth.uid(), now()
-  from upload_rows r
-  where r.upload_id = p_upload_id
-  on conflict (term_result_id, subject_id) do update
-    set reported_name = excluded.reported_name,
-        mark_percent = excluded.mark_percent,
-        achievement_level = excluded.achievement_level,
-        source = 'scan',
-        upload_id = excluded.upload_id,
-        confirmed_by = excluded.confirmed_by,
-        confirmed_at = excluded.confirmed_at,
-        updated_at = now();
-
-  update report_uploads
-     set status = 'confirmed', confirmed_at = now(), delete_after = now() + interval '30 days'
-   where id = p_upload_id;
 end $$;
+
+create trigger subject_marks_audit
+  after insert or update or delete on subject_marks
+  for each row execute function log_mark_change();
+
+-- An extra subject belongs to one learner and cannot be used for anyone else.
+create or replace function check_subject_for_learner() returns trigger
+language plpgsql security definer set search_path = public as $$
+declare owner uuid;
+begin
+  if new.subject_id is null then
+    return new;
+  end if;
+  select created_for_learner into owner from subjects where id = new.subject_id;
+  if owner is not null and owner <> new.learner_id then
+    raise exception 'subject belongs to a different learner' using errcode = '23503';
+  end if;
+  return new;
+end $$;
+
+create trigger subject_marks_subject_check
+  before insert or update of subject_id, learner_id on subject_marks
+  for each row execute function check_subject_for_learner();
+
+-- ---------------------------------------------------------------------
+-- Report card copies: stored for record keeping, never read by the app.
+-- File path: <learner_id>/<attachment_id>.<ext> in the private 'report-attachments' bucket.
+-- ---------------------------------------------------------------------
+create table report_attachments (
+  id           uuid primary key default gen_random_uuid(),
+  learner_id   uuid not null,
+  enrolment_id uuid not null,
+  term         smallint check (term between 1 and 4),   -- null = a year-end or whole-year report
+  file_name    text not null,
+  storage_path text not null unique,
+  mime_type    text not null check (mime_type in
+                 ('application/pdf', 'image/jpeg', 'image/png', 'image/webp', 'image/heic')),
+  size_bytes   integer not null check (size_bytes > 0 and size_bytes <= 10485760),  -- 10 MB
+  note         text,
+  uploaded_by  uuid default auth.uid() references profiles(id) on delete set null,
+  uploaded_at  timestamptz not null default now(),
+  foreign key (enrolment_id, learner_id) references enrolments(id, learner_id) on delete cascade,
+  check (storage_path like learner_id::text || '/%')
+);
 
 -- ---------------------------------------------------------------------
 -- Extramurals, goals and private notes
@@ -311,12 +342,16 @@ create table activity_seasons (
 create table goals (
   id             uuid primary key default gen_random_uuid(),
   learner_id     uuid not null references learners(id) on delete cascade,
-  subject_id     smallint references subjects(id),
+  subject_id     smallint references subjects(id) deferrable initially deferred,
   target_percent numeric(5,2) not null check (target_percent between 0 and 100),
   set_on         date not null default current_date,
   achieved_on    date,
   created_at     timestamptz not null default now()
 );
+
+create trigger goals_subject_check
+  before insert or update of subject_id, learner_id on goals
+  for each row execute function check_subject_for_learner();
 
 -- Private by default. The learner decides, entry by entry, whether guardians can read it.
 create table journal_entries (
@@ -335,21 +370,51 @@ create table journal_entries (
 -- Insights are views, not stored copies, so they never go stale.
 -- ---------------------------------------------------------------------
 
--- Average per term. Powers the journey map and the term bars on My story.
+-- Every mark that counts toward an average: a percentage exists, the subject counts,
+-- and it is not a component whose umbrella subject already has a mark in the same term.
+create view counted_marks with (security_invoker = true) as
+select sm.learner_id,
+       sm.term_result_id,
+       sm.subject_id,
+       sm.mark_percent,
+       s.is_life_orientation
+from subject_marks sm
+join subjects s on s.id = sm.subject_id
+where sm.mark_percent is not null
+  and s.counts_toward_average
+  and not exists (
+    select 1 from subject_marks p
+    where p.term_result_id = sm.term_result_id
+      and p.subject_id = s.parent_subject_id
+      and p.mark_percent is not null
+  );
+
+-- Average per term, with and without Life Orientation. Powers the journey map and the term bars.
 create view term_averages with (security_invoker = true) as
 select tr.learner_id,
        e.id            as enrolment_id,
        e.calendar_year,
        e.grade,
        tr.term,
-       round(avg(sm.mark_percent) filter (where s.counts_toward_average), 1) as average_percent,
-       count(*) filter (where s.counts_toward_average)                       as subjects_counted
-from term_results tr
-join enrolments e     on e.id = tr.enrolment_id
-join subject_marks sm on sm.term_result_id = tr.id
-join subjects s       on s.id = sm.subject_id
-where sm.mark_percent is not null
+       round(avg(cm.mark_percent), 1)                                          as average_percent,
+       round(avg(cm.mark_percent) filter (where not cm.is_life_orientation), 1) as average_excluding_lo,
+       count(*)                                                                as subjects_counted
+from counted_marks cm
+join term_results tr on tr.id = cm.term_result_id
+join enrolments e    on e.id = tr.enrolment_id
 group by tr.learner_id, e.id, e.calendar_year, e.grade, tr.term;
+
+-- Year average: the mean of the term averages recorded so far (not of every mark).
+create view year_averages with (security_invoker = true) as
+select learner_id,
+       enrolment_id,
+       calendar_year,
+       grade,
+       round(avg(average_percent), 1)       as average_percent,
+       round(avg(average_excluding_lo), 1)  as average_excluding_lo,
+       count(*)                             as terms_recorded
+from term_averages
+group by learner_id, enrolment_id, calendar_year, grade;
 
 -- Every subject mark with its change since the previous term. Powers the subject story
 -- and pattern spotting (for example, "Term 3 dipped in Grade 8 and Grade 9").
@@ -375,12 +440,14 @@ where sm.mark_percent is not null;
 -- Indexes (foreign keys and the common lookups)
 -- ---------------------------------------------------------------------
 create index on learner_guardians (guardian_id);
+create index on subjects (parent_subject_id);
+create index on subjects (created_for_learner);
 create index on enrolments (learner_id);
 create index on term_results (learner_id);
 create index on subject_marks (learner_id, subject_id);
 create index on subject_marks (term_result_id);
-create index on report_uploads (learner_id, status);
-create index on upload_rows (upload_id);
+create index on mark_audit (learner_id, changed_at desc);
+create index on report_attachments (learner_id);
 create index on activity_seasons (learner_id);
 create index on goals (learner_id);
 create index on journal_entries (learner_id);
@@ -400,8 +467,12 @@ end $$;
 
 -- ---------------------------------------------------------------------
 -- Row level security
--- Rules: a learner sees their own data. A guardian sees marks and trends always,
--- extramurals unless the learner switched sharing off, and journal entries only when shared.
+-- Rules:
+--  * A learner sees their own data. A guardian sees marks and trends ALWAYS: there is no setting
+--    that hides marks, and a learner cannot delete marks, terms, years or report copies (only
+--    guardians can), nor remove a guardian. Corrections are allowed but logged in mark_audit.
+--  * Extramurals are visible to guardians unless the learner switched sharing off.
+--  * Journal entries are visible to guardians only when marked as shared.
 -- ---------------------------------------------------------------------
 
 alter table profiles          enable row level security;
@@ -433,27 +504,39 @@ create policy consents_insert on consents for insert
 create policy consents_update on consents for update
   using (guardian_id = auth.uid() and is_guardian(learner_id));
 
--- Tables where the learner and their guardians share the same access.
+-- The record: learner and guardians can read and add or correct; only guardians can delete.
 do $$
 declare t text;
 begin
-  foreach t in array array['enrolments', 'term_results', 'subject_marks', 'report_uploads', 'upload_rows', 'goals'] loop
+  foreach t in array array['enrolments', 'term_results', 'subject_marks', 'report_attachments'] loop
     execute format('alter table %I enable row level security', t);
     execute format('create policy %I on %I for select using (can_access_learner(learner_id))', t || '_select', t);
-    execute format('create policy %I on %I for all using (can_edit_learner(learner_id)) with check (can_edit_learner(learner_id))',
-                   t || '_write', t);
+    execute format('create policy %I on %I for insert with check (can_edit_learner(learner_id))', t || '_insert', t);
+    execute format('create policy %I on %I for update using (can_edit_learner(learner_id)) with check (can_edit_learner(learner_id))',
+                   t || '_update', t);
+    execute format('create policy %I on %I for delete using (is_guardian(learner_id, true))', t || '_delete', t);
   end loop;
 end $$;
 
+-- Goals: the learner and guardians share the same access.
+alter table goals enable row level security;
+create policy goals_select on goals for select using (can_access_learner(learner_id));
+create policy goals_write on goals for all
+  using (can_edit_learner(learner_id)) with check (can_edit_learner(learner_id));
+
+-- The change log is read-only for everyone (the trigger writes it).
+alter table mark_audit enable row level security;
+create policy mark_audit_select on mark_audit for select using (can_access_learner(learner_id));
+
 -- Extramurals: guardians see them only while the learner shares them.
+-- Write policies are split by command on purpose: a "for all" policy also grants SELECT,
+-- and permissive policies are OR-ed, which would let a guardian read hidden extramurals.
 alter table activities        enable row level security;
 alter table activity_seasons  enable row level security;
 
 create policy activities_select on activities for select
   using (is_learner_self(learner_id)
          or (is_guardian(learner_id) and (select l.share_extramurals from learners l where l.id = learner_id)));
--- Write policies are split by command on purpose: a "for all" policy also grants SELECT,
--- and permissive policies are OR-ed, which would let a guardian read hidden extramurals.
 create policy activities_insert on activities for insert
   with check (can_edit_learner(learner_id));
 create policy activities_update on activities for update
@@ -479,30 +562,47 @@ create policy journal_select on journal_entries for select
 create policy journal_write on journal_entries for all
   using (is_learner_self(learner_id)) with check (is_learner_self(learner_id));
 
--- Reference data: everyone signed in can read, only the service role can write.
+-- Subjects: everyone signed in reads the standard ones; a learner's extra subjects are visible
+-- to that learner's people only, and only they can create or change them.
+alter table subjects enable row level security;
+
+create policy subjects_select on subjects for select to authenticated
+  using (created_for_learner is null or can_access_learner(created_for_learner));
+create policy subjects_insert on subjects for insert to authenticated
+  with check (created_for_learner is not null and can_edit_learner(created_for_learner));
+create policy subjects_update on subjects for update to authenticated
+  using (created_for_learner is not null and can_edit_learner(created_for_learner))
+  with check (created_for_learner is not null and can_edit_learner(created_for_learner));
+create policy subjects_delete on subjects for delete to authenticated
+  using (created_for_learner is not null and can_edit_learner(created_for_learner));
+
+-- Other reference data: everyone signed in can read, only the service role can write.
 do $$
 declare t text;
 begin
-  foreach t in array array['subjects', 'subject_aliases', 'career_fields', 'career_field_subjects'] loop
+  foreach t in array array['subject_aliases', 'career_fields', 'career_field_subjects'] loop
     execute format('alter table %I enable row level security', t);
     execute format('create policy %I on %I for select to authenticated using (true)', t || '_read', t);
   end loop;
 end $$;
 
 -- ---------------------------------------------------------------------
--- Storage: private bucket for scanned report cards.
--- Object path is <learner_id>/<upload_id>.<ext>, so the first folder is the learner.
+-- Storage: private bucket for report card copies, 10 MB limit, PDF and images only.
+-- Object path is <learner_id>/<attachment_id>.<ext>, so the first folder is the learner.
+-- Deleting a file: delete the row in report_attachments, then remove the object through the
+-- Storage API (not by SQL), because the file itself lives outside Postgres.
 -- ---------------------------------------------------------------------
-insert into storage.buckets (id, name, public)
-values ('report-scans', 'report-scans', false)
+insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+values ('report-attachments', 'report-attachments', false, 10485760,
+        array['application/pdf', 'image/jpeg', 'image/png', 'image/webp', 'image/heic'])
 on conflict (id) do nothing;
 
-create policy scans_select on storage.objects for select to authenticated
-  using (bucket_id = 'report-scans'
+create policy attachments_select on storage.objects for select to authenticated
+  using (bucket_id = 'report-attachments'
          and can_access_learner(((storage.foldername(name))[1])::uuid));
-create policy scans_insert on storage.objects for insert to authenticated
-  with check (bucket_id = 'report-scans'
+create policy attachments_insert on storage.objects for insert to authenticated
+  with check (bucket_id = 'report-attachments'
               and can_edit_learner(((storage.foldername(name))[1])::uuid));
-create policy scans_delete on storage.objects for delete to authenticated
-  using (bucket_id = 'report-scans'
-         and can_edit_learner(((storage.foldername(name))[1])::uuid));
+create policy attachments_delete on storage.objects for delete to authenticated
+  using (bucket_id = 'report-attachments'
+         and is_guardian(((storage.foldername(name))[1])::uuid, true));
